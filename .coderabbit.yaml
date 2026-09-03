@@ -1,0 +1,7 @@
+language: en-AU
+reviews:
+  high_level_summary: true
+  request_changes_workflow: false
+  path_filters:
+    - terraform/**
+    - .github/**

@@ -1,0 +1,31 @@
+# Copy to terraform.tfvars and adjust. Never commit the real file.
+
+region      = "ap-southeast-2"
+environment = "prod"
+name_prefix = "blaksmith"
+
+# Data residency. A plan targeting anything outside this list fails before creating anything.
+allowed_regions = ["ap-southeast-2"]
+
+az_count = 3
+
+# S3 Object Lock retention, COMPLIANCE mode. Cannot be shortened once objects are written,
+# and Object Lock itself cannot be enabled after bucket creation.
+evidence_retention_days = 2555 # 7 years
+trail_retention_days    = 2555
+
+db_instance_class        = "db.m6g.large"
+db_allocated_storage     = 100
+db_max_allocated_storage = 1000
+
+# Confirm the subscription from the email AWS sends, or findings go nowhere.
+alert_email = "security@example.gov.au"
+
+# Leave web_image_uri empty on the first apply to provision infrastructure only. When set,
+# public_url and certificate_arn become required — there is no HTTP fallback.
+web_image_uri        = ""
+worker_image_uri     = ""
+public_url           = "https://blaksmith.example.gov.au"
+certificate_arn      = ""
+desired_count        = 2
+worker_desired_count = 0

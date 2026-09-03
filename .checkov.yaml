@@ -1,0 +1,17 @@
+compact: true
+directory:
+  - terraform
+framework:
+  - terraform
+download-external-modules: false
+skip-path:
+  - terraform/.terraform
+skip-check:
+  - CKV_AWS_150 # ALB deletion protection is enabled for prod and disabled for test teardown
+  - CKV2_AWS_62 # No event consumer for evidence objects
+  - CKV_AWS_144 # Cross-region replication is buyer-owned DR
+  - CKV2_AWS_57 # No Secrets Manager rotation Lambda in this stack
+  - CKV_AWS_378 # Target group HTTP is intended; TLS terminates on the ALB
+  - CKV_AWS_161 # Secrets Manager supports owner bootstrap and the restricted RLS role
+  - CKV2_AWS_30 # PostgreSQL and upgrade logs are already exported
+  - CKV_AWS_356 # License Manager consumption APIs do not support resource ARNs

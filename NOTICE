@@ -1,0 +1,9 @@
+Kelpie AWS Marketplace deploy
+Copyright 2026 Yuma IT
+
+This repository contains Terraform, Helm, CloudFormation, and IAM artifacts
+for deploying the Kelpie container product in a buyer AWS account.
+
+The Kelpie application container image is not licensed under Apache-2.0.
+Use of the image requires an AWS Marketplace subscription to Kelpie.
+Image: 709825985650.dkr.ecr.us-east-1.amazonaws.com/yuma-it/kelpie-aws
