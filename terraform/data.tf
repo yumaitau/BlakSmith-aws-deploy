@@ -307,6 +307,11 @@ resource "random_password" "better_auth" {
   special = false
 }
 
+resource "random_password" "bootstrap_owner" {
+  length  = 32
+  special = false
+}
+
 resource "aws_secretsmanager_secret" "application" {
   name                    = "${local.name}/application"
   description             = "BlakSmith restricted database and authentication secrets"
@@ -317,8 +322,9 @@ resource "aws_secretsmanager_secret" "application" {
 resource "aws_secretsmanager_secret_version" "application" {
   secret_id = aws_secretsmanager_secret.application.id
   secret_string = jsonencode({
-    app_database_password = random_password.app_database.result
-    better_auth_secret    = random_password.better_auth.result
+    app_database_password    = random_password.app_database.result
+    better_auth_secret       = random_password.better_auth.result
+    bootstrap_owner_password = random_password.bootstrap_owner.result
   })
 }
 

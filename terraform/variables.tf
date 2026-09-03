@@ -109,6 +109,30 @@ variable "public_url" {
   default     = ""
 }
 
+variable "bootstrap_tenant_slug" {
+  description = "Slug for the first tenant created during licensed startup."
+  type        = string
+  default     = "default"
+}
+
+variable "bootstrap_tenant_name" {
+  description = "Display name for the first tenant."
+  type        = string
+  default     = "BlakSmith"
+}
+
+variable "bootstrap_owner_email" {
+  description = "Email address for the first tenant owner. Required when deploying the web image."
+  type        = string
+  default     = ""
+}
+
+variable "bootstrap_owner_name" {
+  description = "Display name for the first tenant owner."
+  type        = string
+  default     = "Account owner"
+}
+
 variable "certificate_arn" {
   description = <<-EOT
     ACM certificate ARN for the HTTPS listener.
@@ -166,6 +190,12 @@ resource "terraform_data" "require_tls" {
     precondition {
       condition     = var.worker_desired_count == 0 || var.worker_image_uri != ""
       error_message = "worker_image_uri is required when worker_desired_count is greater than zero."
+    }
+
+
+    precondition {
+      condition     = can(regex("^[^@[:space:]]+@[^@[:space:]]+\\.[^@[:space:]]+$", var.bootstrap_owner_email))
+      error_message = "bootstrap_owner_email must be a valid email address when web_image_uri is set."
     }
   }
 }

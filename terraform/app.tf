@@ -215,6 +215,10 @@ resource "aws_ecs_task_definition" "app" {
       { name = "APP_URL", value = var.public_url },
       { name = "BETTER_AUTH_URL", value = var.public_url },
       { name = "BETTER_AUTH_TRUSTED_PROXIES", value = var.vpc_cidr },
+      { name = "BLAKSMITH_BOOTSTRAP_TENANT_SLUG", value = var.bootstrap_tenant_slug },
+      { name = "BLAKSMITH_BOOTSTRAP_TENANT_NAME", value = var.bootstrap_tenant_name },
+      { name = "BLAKSMITH_BOOTSTRAP_OWNER_EMAIL", value = var.bootstrap_owner_email },
+      { name = "BLAKSMITH_BOOTSTRAP_OWNER_NAME", value = var.bootstrap_owner_name },
       { name = "BLAKSMITH_DB_HOST", value = aws_db_instance.main.address },
       { name = "BLAKSMITH_DB_PORT", value = tostring(aws_db_instance.main.port) },
       { name = "BLAKSMITH_DB_NAME", value = aws_db_instance.main.db_name },
@@ -243,6 +247,10 @@ resource "aws_ecs_task_definition" "app" {
       {
         name      = "BETTER_AUTH_SECRET"
         valueFrom = "${aws_secretsmanager_secret.application.arn}:better_auth_secret::"
+      },
+      {
+        name      = "BLAKSMITH_BOOTSTRAP_OWNER_PASSWORD"
+        valueFrom = "${aws_secretsmanager_secret.application.arn}:bootstrap_owner_password::"
       },
     ]
 

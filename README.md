@@ -51,7 +51,8 @@ Edit `terraform.tfvars`:
 2. Set `public_url` to the HTTPS origin covered by `certificate_arn`.
 3. Choose `environment = "buyer"` for a limited-offer test or `"prod"` for retained,
    deletion-protected production resources.
-4. Leave `worker_desired_count = 0` for the first apply.
+4. Set the bootstrap tenant and owner fields to the real first administrator.
+5. Leave `worker_desired_count = 0` for the first apply.
 
 Configure your private state backend, then deploy:
 
@@ -69,8 +70,18 @@ terraform output load_balancer_dns
 Point the `public_url` hostname at `load_balancer_dns`. After the web service is healthy and
 `GET /api/health` succeeds, set `worker_desired_count = 1` and apply again.
 
-The first account owner is provisioned through the product onboarding flow. No default user,
-password, Marketplace product code, or licensing bypass is accepted by Terraform.
+The licensed web startup provisions the specified owner idempotently. Retrieve the generated
+one-time password without printing any other secret fields, sign in, and rotate it immediately:
+
+```sh
+secret_arn="$(terraform output -raw application_secret_arn)"
+aws secretsmanager get-secret-value --secret-id "$secret_arn" \
+  --query SecretString --output text \
+  | jq -r '.bootstrap_owner_password'
+```
+
+No default user, static password, buyer-supplied Marketplace product code, or licensing bypass
+is accepted by Terraform.
 
 ## Runtime licensing
 

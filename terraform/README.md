@@ -9,6 +9,8 @@ Important operating constraints:
 - `public_url` must be a bare HTTPS origin whose hostname is covered by `certificate_arn`.
 - Image values must be existing AWS Marketplace ECR SHA tags or digests, never `latest`.
 - Run the first apply with `worker_desired_count = 0`; enable the worker after web health passes.
+- Set the bootstrap owner fields to a real administrator; their generated initial password is
+  stored in the application secret and must be rotated after first sign-in.
 - The task role contains AWS License Manager consumption permissions. Removing them makes the
   Marketplace containers fail closed.
 - `environment = "prod"` enables deletion protection and Multi-AZ RDS. `"buyer"` is intended
