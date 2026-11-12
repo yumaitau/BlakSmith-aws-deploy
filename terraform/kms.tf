@@ -18,6 +18,7 @@ resource "aws_kms_key" "database" {
   description             = "BlakSmith RDS storage, snapshots and Performance Insights"
   enable_key_rotation     = true
   deletion_window_in_days = local.key_deletion_window
+  policy                  = data.aws_iam_policy_document.account_managed_key.json
 }
 
 resource "aws_kms_alias" "database" {
@@ -29,6 +30,7 @@ resource "aws_kms_key" "storage" {
   description             = "BlakSmith S3 documents and evidence"
   enable_key_rotation     = true
   deletion_window_in_days = local.key_deletion_window
+  policy                  = data.aws_iam_policy_document.account_managed_key.json
 }
 
 resource "aws_kms_alias" "storage" {
@@ -63,7 +65,26 @@ resource "aws_kms_alias" "application_data" {
   target_key_id = aws_kms_key.application_data.key_id
 }
 
+# The AWS default key policy, written out. RDS and S3 reach these keys through IAM and grants,
+# so the account statement is all they need.
+data "aws_iam_policy_document" "account_managed_key" {
+  #checkov:skip=CKV_AWS_109:Account root statement is the AWS default key policy; it delegates key access to IAM and keeps the key manageable
+  #checkov:skip=CKV_AWS_111:Account root statement is the AWS default key policy; it delegates key access to IAM and keeps the key manageable
+  statement {
+    sid       = "EnableIamUserPermissions"
+    actions   = ["kms:*"]
+    resources = ["*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${local.account_id}:root"]
+    }
+  }
+}
+
 data "aws_iam_policy_document" "logs_key" {
+  #checkov:skip=CKV_AWS_109:Account root statement is the AWS default key policy; it delegates key access to IAM and keeps the key manageable
+  #checkov:skip=CKV_AWS_111:Account root statement is the AWS default key policy; it delegates key access to IAM and keeps the key manageable
   statement {
     sid       = "EnableIamUserPermissions"
     actions   = ["kms:*"]
@@ -103,6 +124,8 @@ data "aws_iam_policy_document" "logs_key" {
 }
 
 data "aws_iam_policy_document" "application_data_key" {
+  #checkov:skip=CKV_AWS_109:Account root statement is the AWS default key policy; it delegates key access to IAM and keeps the key manageable
+  #checkov:skip=CKV_AWS_111:Account root statement is the AWS default key policy; it delegates key access to IAM and keeps the key manageable
   statement {
     sid       = "EnableIamUserPermissions"
     actions   = ["kms:*"]

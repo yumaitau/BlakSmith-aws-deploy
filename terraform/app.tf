@@ -161,12 +161,23 @@ resource "aws_security_group" "service" {
     security_groups = [aws_security_group.alb[0].id]
   }
 
+  # HTTPS only: KMS, Secrets Manager, ECR, STS, SSM and CloudWatch Logs are reached through
+  # interface endpoints or the S3 gateway endpoint, all on 443. DNS goes to the VPC resolver,
+  # which security groups do not filter.
   egress {
-    description = "Outbound for KMS, Secrets Manager and ECR"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
+    description = "HTTPS to AWS APIs and endpoints"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    description     = "PostgreSQL to the data tier"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.database.id]
   }
 
   tags = { Name = "${local.name}-service" }
@@ -406,6 +417,7 @@ resource "aws_ecs_service" "worker" {
 # --- Load balancer ------------------------------------------------------------------------------------
 
 resource "aws_security_group" "alb" {
+  #checkov:skip=CKV_AWS_260:Port 80 only reaches the http_redirect listener, which returns a 301 to HTTPS and serves no content
   count       = local.deploy_app ? 1 : 0
   name        = "${local.name}-alb"
   description = "BlakSmith load balancer"
@@ -439,6 +451,7 @@ resource "aws_security_group" "alb" {
 }
 
 resource "aws_lb" "main" {
+  #checkov:skip=CKV2_AWS_76:KnownBadInputs, the Log4j rule group, is attached; this check also demands AnonymousIpList, which is unrelated to Log4j and would block legitimate VPN users
   count              = local.deploy_app ? 1 : 0
   name               = local.name
   load_balancer_type = "application"
@@ -519,34 +532,93 @@ resource "aws_wafv2_web_acl" "main" {
     allow {}
   }
 
-  dynamic "rule" {
-    for_each = {
-      AWSManagedRulesCommonRuleSet          = 0
-      AWSManagedRulesKnownBadInputsRuleSet  = 1
-      AWSManagedRulesSQLiRuleSet            = 2
-      AWSManagedRulesAmazonIpReputationList = 3
+  # AWS managed rule groups, written out rather than generated so scanners can see that
+  # KnownBadInputs (which covers Log4j JNDI lookups) is attached.
+  rule {
+    name     = "AWSManagedRulesCommonRuleSet"
+    priority = 0
+
+    override_action {
+      none {}
     }
 
-    content {
-      name     = rule.key
-      priority = rule.value
-
-      override_action {
-        none {}
+    statement {
+      managed_rule_group_statement {
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesCommonRuleSet"
       }
+    }
 
-      statement {
-        managed_rule_group_statement {
-          vendor_name = "AWS"
-          name        = rule.key
-        }
-      }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "AWSManagedRulesCommonRuleSet"
+      sampled_requests_enabled   = true
+    }
+  }
 
-      visibility_config {
-        cloudwatch_metrics_enabled = true
-        metric_name                = rule.key
-        sampled_requests_enabled   = true
+  rule {
+    name     = "AWSManagedRulesKnownBadInputsRuleSet"
+    priority = 1
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesKnownBadInputsRuleSet"
       }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "AWSManagedRulesKnownBadInputsRuleSet"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  rule {
+    name     = "AWSManagedRulesSQLiRuleSet"
+    priority = 2
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesSQLiRuleSet"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "AWSManagedRulesSQLiRuleSet"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  rule {
+    name     = "AWSManagedRulesAmazonIpReputationList"
+    priority = 3
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesAmazonIpReputationList"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "AWSManagedRulesAmazonIpReputationList"
+      sampled_requests_enabled   = true
     }
   }
 
@@ -577,6 +649,33 @@ resource "aws_wafv2_web_acl" "main" {
     cloudwatch_metrics_enabled = true
     metric_name                = "BlakSmithWebAcl"
     sampled_requests_enabled   = true
+  }
+}
+
+# WAF decisions are the only record of what the edge blocked. Credentials and session cookies
+# are redacted before they reach the log.
+resource "aws_cloudwatch_log_group" "waf" {
+  count             = local.deploy_app ? 1 : 0
+  name              = "aws-waf-logs-${local.name}"
+  retention_in_days = 365
+  kms_key_id        = aws_kms_key.logs.arn
+}
+
+resource "aws_wafv2_web_acl_logging_configuration" "main" {
+  count                   = local.deploy_app ? 1 : 0
+  resource_arn            = aws_wafv2_web_acl.main[0].arn
+  log_destination_configs = [aws_cloudwatch_log_group.waf[0].arn]
+
+  redacted_fields {
+    single_header {
+      name = "authorization"
+    }
+  }
+
+  redacted_fields {
+    single_header {
+      name = "cookie"
+    }
   }
 }
 

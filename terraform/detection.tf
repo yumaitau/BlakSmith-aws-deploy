@@ -121,13 +121,77 @@ data "aws_iam_policy_document" "trail_bucket" {
   }
 }
 
+resource "aws_s3_bucket_lifecycle_configuration" "trail" {
+  bucket = aws_s3_bucket.trail.id
+
+  rule {
+    id     = "abort-incomplete-uploads"
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload { days_after_initiation = 7 }
+  }
+}
+
+resource "aws_s3_bucket_logging" "trail" {
+  bucket        = aws_s3_bucket.trail.id
+  target_bucket = aws_s3_bucket.access_logs.id
+  target_prefix = "trail/"
+}
+
 resource "aws_s3_bucket_policy" "trail" {
   bucket = aws_s3_bucket.trail.id
   policy = data.aws_iam_policy_document.trail_bucket.json
 }
 
+# A CloudWatch copy of the trail makes it searchable and alertable in near real time. The S3
+# copy under Object Lock remains the record of authority.
+resource "aws_cloudwatch_log_group" "trail" {
+  name              = "/aws/cloudtrail/${local.name}"
+  retention_in_days = 365
+  kms_key_id        = aws_kms_key.logs.arn
+}
+
+resource "aws_iam_role" "trail_logs" {
+  name               = "${local.name}-trail-logs"
+  assume_role_policy = data.aws_iam_policy_document.trail_logs_assume.json
+}
+
+data "aws_iam_policy_document" "trail_logs_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudtrail.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [local.account_id]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "trail_logs" {
+  name = "write-trail-logs"
+  role = aws_iam_role.trail_logs.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+      Resource = "${aws_cloudwatch_log_group.trail.arn}:*"
+    }]
+  })
+}
+
 resource "aws_cloudtrail" "main" {
+  #checkov:skip=CKV_AWS_252:The only SNS topic is the security alerts email topic; a notification per log file would flood it
   name                          = "${local.name}-trail"
+  cloud_watch_logs_group_arn    = "${aws_cloudwatch_log_group.trail.arn}:*"
+  cloud_watch_logs_role_arn     = aws_iam_role.trail_logs.arn
   s3_bucket_name                = aws_s3_bucket.trail.id
   kms_key_id                    = aws_kms_key.logs.arn
   include_global_service_events = true
@@ -168,6 +232,7 @@ resource "aws_cloudtrail" "main" {
 # --- GuardDuty ---------------------------------------------------------------------------------
 
 resource "aws_guardduty_detector" "main" {
+  #checkov:skip=CKV2_AWS_3:Single-account stack deployed into the buyer's account; organisation-wide GuardDuty is the buyer's to manage
   enable                       = true
   finding_publishing_frequency = "FIFTEEN_MINUTES"
 }

@@ -12,6 +12,13 @@ resource "aws_vpc" "main" {
   tags = { Name = "${local.name}-vpc" }
 }
 
+# Nothing is placed in the default security group; every resource has its own. Removing its
+# rules means anything launched without an explicit group gets no network access at all.
+resource "aws_default_security_group" "main" {
+  vpc_id = aws_vpc.main.id
+  tags   = { Name = "${local.name}-default-deny" }
+}
+
 resource "aws_internet_gateway" "main" {
   vpc_id = aws_vpc.main.id
   tags   = { Name = "${local.name}-igw" }
