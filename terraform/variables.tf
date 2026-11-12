@@ -166,6 +166,7 @@ locals {
 }
 
 data "aws_availability_zones" "available" {
+  #checkov:skip=CKV_AWS_394:Only the first az_count zones are used, so a new zone does not change the result; pinning zone IDs would reshuffle existing subnets and the database subnet group
   state = "available"
 
   filter {

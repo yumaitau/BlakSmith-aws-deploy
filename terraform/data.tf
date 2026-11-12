@@ -13,6 +13,8 @@ locals {
 
 # Access logs live in their own bucket, which cannot log to itself.
 resource "aws_s3_bucket" "access_logs" {
+  #checkov:skip=CKV_AWS_145:S3 server access logs and ALB access logs can only be delivered to an SSE-S3 bucket
+  #checkov:skip=CKV_AWS_18:This is the access log target; a bucket cannot usefully log to itself
   bucket        = "${local.name}-access-logs-${local.bucket_suffix}"
   force_destroy = !local.is_prod
 }
@@ -27,6 +29,7 @@ resource "aws_s3_bucket_public_access_block" "access_logs" {
 
 # S3 server access logging cannot write to an SSE-KMS bucket, so this one uses S3-managed
 # keys. It holds request metadata, never record content.
+# trivy:ignore:AWS-0132 S3 and ALB access log delivery require SSE-S3 on the target bucket
 resource "aws_s3_bucket_server_side_encryption_configuration" "access_logs" {
   bucket = aws_s3_bucket.access_logs.id
 
@@ -50,6 +53,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "access_logs" {
     status = "Enabled"
     filter {}
     expiration { days = 400 }
+    abort_incomplete_multipart_upload { days_after_initiation = 7 }
   }
 }
 
@@ -139,6 +143,30 @@ resource "aws_s3_bucket_object_lock_configuration" "evidence" {
       mode = "COMPLIANCE"
       days = var.evidence_retention_days
     }
+  }
+}
+
+# Lifecycle rules here only clean up abandoned multipart uploads. Records are never expired by
+# lifecycle: retention is governed by versioning and, for evidence, Object Lock.
+resource "aws_s3_bucket_lifecycle_configuration" "documents" {
+  bucket = aws_s3_bucket.documents.id
+
+  rule {
+    id     = "abort-incomplete-uploads"
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload { days_after_initiation = 7 }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "evidence" {
+  bucket = aws_s3_bucket.evidence.id
+
+  rule {
+    id     = "abort-incomplete-uploads"
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload { days_after_initiation = 7 }
   }
 }
 
