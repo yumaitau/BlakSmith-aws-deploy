@@ -89,6 +89,8 @@ jobs:
           scanners: secret,misconfig
           exit-code: 1
           severity: HIGH,CRITICAL
+          # Without this, SARIF output ignores the severity filter and any finding fails the job.
+          limit-severities-for-sarif: true
           format: sarif
           output: trivy.sarif
       - name: Upload SARIF
