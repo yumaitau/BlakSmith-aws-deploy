@@ -93,6 +93,20 @@ data "aws_iam_policy_document" "task" {
     resources = [aws_s3_bucket.documents.arn, "${aws_s3_bucket.documents.arn}/*"]
   }
 
+  # Revoking a sharing package must remove every version of it and of BlakSmith's custody
+  # copy of its key: the documents bucket is versioned, so a plain delete only hides them.
+  statement {
+    sid       = "SharingPackageRevocation"
+    actions   = ["s3:ListBucketVersions"]
+    resources = [aws_s3_bucket.documents.arn]
+  }
+
+  statement {
+    sid       = "SharingPackagePurge"
+    actions   = ["s3:DeleteObjectVersion"]
+    resources = ["${aws_s3_bucket.documents.arn}/*tenants/*/sharing/*"]
+  }
+
   statement {
     sid       = "EvidenceAppendOnly"
     actions   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
@@ -119,6 +133,112 @@ data "aws_iam_policy_document" "task" {
     resources = [aws_kms_key.application_data.arn, aws_kms_key.storage.arn]
   }
 
+  # Tenant, custodian, and s38 CMKs. The app calls kmsAliasForScope under the same
+  # prefix injected as BLAKSMITH_KMS_ALIAS_PREFIX. A prefix-wide alias grant would also
+  # match infrastructure keys, so those aliases are excluded. The ARN grant above stays;
+  # application_data is not the envelope root.
+  statement {
+    sid       = "TenantEnvelopeKeys"
+    actions   = ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"]
+    resources = ["arn:aws:kms:${var.region}:${local.account_id}:key/*"]
+
+    condition {
+      test     = "ForAnyValue:StringLike"
+      variable = "kms:ResourceAliases"
+      values   = ["alias/${local.name}/*"]
+    }
+
+    condition {
+      test     = "ForAllValues:StringNotLike"
+      variable = "kms:ResourceAliases"
+      values = [
+        "alias/${local.name}/database",
+        "alias/${local.name}/storage",
+        "alias/${local.name}/logs",
+        "alias/${local.name}/secrets",
+        "alias/${local.name}/application-data",
+        "alias/${local.name}/applicationdata",
+      ]
+    }
+  }
+
+  # Tenant onboarding creates the tenant's CMK and alias (#139, one CMK per tenant). The
+  # role may create a key only when tagged as a tenant envelope key, may not bypass the
+  # policy lockout check, and may alias it only under the tenant prefix. It still cannot
+  # schedule deletion, disable, or change the policy afterwards (NeverDestroyKeys).
+  dynamic "statement" {
+    for_each = var.tenant_key_self_provisioning ? [1] : []
+    content {
+      sid       = "CreateTenantEnvelopeKey"
+      actions   = ["kms:CreateKey", "kms:TagResource"]
+      resources = ["*"]
+      condition {
+        test     = "StringEquals"
+        variable = "aws:RequestTag/Purpose"
+        values   = ["tenant-envelope"]
+      }
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.tenant_key_self_provisioning ? [1] : []
+    content {
+      sid     = "AliasAndRotateTenantEnvelopeKey"
+      actions = ["kms:CreateAlias", "kms:EnableKeyRotation", "kms:DescribeKey"]
+      resources = [
+        "arn:aws:kms:${var.region}:${local.account_id}:alias/${local.name}/*",
+        "arn:aws:kms:${var.region}:${local.account_id}:key/*",
+      ]
+    }
+  }
+
+  statement {
+    sid       = "NeverBypassKeyPolicyLockout"
+    effect    = "Deny"
+    actions   = ["kms:CreateKey"]
+    resources = ["*"]
+    condition {
+      test     = "Bool"
+      variable = "kms:BypassPolicyLockoutSafetyCheck"
+      values   = ["true"]
+    }
+  }
+
+  # Customer-held keys (#140): the app reaches a client's CMK only by assuming that
+  # tenant's role, tagged with the tenant id. The tenant role's trust policy checks the tag.
+  statement {
+    sid       = "AssumeCustomerTenantRoles"
+    actions   = ["sts:AssumeRole", "sts:TagSession"]
+    resources = ["arn:aws:iam::${local.account_id}:role/${local.name}-tenant-*"]
+  }
+
+  # Escrow (#141): deposit-only. The application may wrap a data key under a tenant's escrow
+  # CMK in the escrow account and can never read one back. The Deny is structural: it holds
+  # even if an escrow key policy were misconfigured to grant Decrypt.
+  dynamic "statement" {
+    for_each = var.escrow_account_id == "" ? [] : [1]
+    content {
+      sid       = "EscrowDepositOnly"
+      actions   = ["kms:Encrypt"]
+      resources = ["arn:aws:kms:${var.region}:${var.escrow_account_id}:key/*"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.escrow_account_id == "" ? [] : [1]
+    content {
+      sid    = "EscrowNeverReadable"
+      effect = "Deny"
+      actions = [
+        "kms:Decrypt",
+        "kms:ReEncrypt*",
+        "kms:CreateGrant",
+        "kms:GenerateDataKey*",
+      ]
+      resources = ["arn:aws:kms:*:${var.escrow_account_id}:key/*"]
+    }
+  }
+
   # The application wraps and unwraps data keys. It must never be able to destroy one —
   # cryptographic erasure belongs to the key custodian role, behind MFA.
   statement {
@@ -133,10 +253,26 @@ data "aws_iam_policy_document" "task" {
     resources = ["*"]
   }
 
+  # Long-running tasks read the RDS-managed owner secret per new connection, so a rotation
+  # needs no restart (packages/db/src/db-secret.ts). Only that secret: the application secret
+  # (app-role password, Better Auth secret, bootstrap password) is injected by the execution
+  # role at start and is not readable by application code.
   statement {
-    sid       = "ReadDatabaseSecret"
+    sid       = "ReadRotatingDatabaseSecret"
     actions   = ["secretsmanager:GetSecretValue"]
-    resources = [aws_db_instance.main.master_user_secret[0].secret_arn, aws_secretsmanager_secret.application.arn]
+    resources = [aws_db_instance.main.master_user_secret[0].secret_arn]
+  }
+
+  statement {
+    sid       = "DecryptRotatingDatabaseSecret"
+    actions   = ["kms:Decrypt"]
+    resources = [aws_kms_key.logs.arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["secretsmanager.${var.region}.amazonaws.com"]
+    }
   }
 }
 
@@ -145,6 +281,72 @@ resource "aws_iam_role_policy" "task" {
   name   = "runtime"
   role   = aws_iam_role.task[0].id
   policy = data.aws_iam_policy_document.task.json
+}
+
+# One role per customer-keyed tenant (#140). The client's key policy names this role, not
+# the shared task role, so a confused-deputy bug serving tenant B cannot use tenant A's
+# grant. Assumable only by the task role, and only with a session tag for this tenant.
+resource "aws_iam_role" "customer_tenant" {
+  for_each             = local.deploy_app ? var.customer_key_tenants : {}
+  name                 = "${local.name}-tenant-${each.key}"
+  description          = "Data-plane use of tenant ${each.key}'s customer-held CMK"
+  max_session_duration = 3600
+  assume_role_policy   = data.aws_iam_policy_document.customer_tenant_assume[each.key].json
+}
+
+data "aws_iam_policy_document" "customer_tenant_assume" {
+  for_each = local.deploy_app ? var.customer_key_tenants : {}
+
+  statement {
+    actions = ["sts:AssumeRole", "sts:TagSession"]
+
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_role.task[0].arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/tenantId"
+      values   = [each.key]
+    }
+  }
+}
+
+data "aws_iam_policy_document" "customer_tenant" {
+  for_each = local.deploy_app ? var.customer_key_tenants : {}
+
+  statement {
+    sid = "CustomerKeyDataPlane"
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+    ]
+    resources = [each.value]
+
+    # Same binding the client's key policy applies, enforced on our side as well.
+    condition {
+      test     = "StringEquals"
+      variable = "kms:EncryptionContext:tenantId"
+      values   = [each.key]
+    }
+  }
+
+  statement {
+    sid       = "NeverAdministerCustomerKey"
+    effect    = "Deny"
+    actions   = ["kms:ScheduleKeyDeletion", "kms:DisableKey", "kms:PutKeyPolicy", "kms:CreateGrant"]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "customer_tenant" {
+  for_each = local.deploy_app ? var.customer_key_tenants : {}
+  name     = "customer-key"
+  role     = aws_iam_role.customer_tenant[each.key].id
+  policy   = data.aws_iam_policy_document.customer_tenant[each.key].json
 }
 
 resource "aws_security_group" "service" {
@@ -159,6 +361,16 @@ resource "aws_security_group" "service" {
     to_port         = 3000
     protocol        = "tcp"
     security_groups = [aws_security_group.alb[0].id]
+  }
+
+  # Same security group, not a second network. Web and the REST API both own /nodes,
+  # so the API is not a second ALB target. Tasks in this group can call it on 8080.
+  ingress {
+    description = "API from the application tier"
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    self        = true
   }
 
   # HTTPS only: KMS, Secrets Manager, ECR, STS, SSM and CloudWatch Logs are reached through
@@ -180,6 +392,14 @@ resource "aws_security_group" "service" {
     security_groups = [aws_security_group.database.id]
   }
 
+  egress {
+    description = "Private API within the application tier"
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    self        = true
+  }
+
   tags = { Name = "${local.name}-service" }
 }
 
@@ -192,6 +412,131 @@ resource "aws_vpc_security_group_ingress_rule" "database_from_service" {
   to_port                      = 5432
   ip_protocol                  = "tcp"
   description                  = "Postgres from the application tier"
+}
+
+# Shared by the long-running web, API and worker tasks. Asserted by tests/app.tftest.hcl.
+#
+# Owner credentials: the username plus the rotating secret's ARN, never the password. The
+# pool reads the secret per new connection (BLAKSMITH_DB_OWNER_SECRET_ARN), so RDS rotating the
+# master password does not break new connections. Bootstrap values are migrate-only.
+locals {
+  runtime_environment = [
+    { name = "NODE_ENV", value = "production" },
+    { name = "AWS_REGION", value = var.region },
+    { name = "HOME", value = "/tmp" },
+    { name = "APP_URL", value = var.public_url },
+    { name = "BETTER_AUTH_URL", value = var.public_url },
+    { name = "BETTER_AUTH_TRUSTED_PROXIES", value = var.vpc_cidr },
+    # IdP-initiated SAML stays off; it would apply to every SAML provider.
+    { name = "BETTER_AUTH_SAML_ALLOW_IDP_INITIATED", value = "false" },
+    { name = "BLAKSMITH_DB_HOST", value = aws_db_instance.main.address },
+    { name = "BLAKSMITH_DB_PORT", value = tostring(aws_db_instance.main.port) },
+    { name = "BLAKSMITH_DB_NAME", value = aws_db_instance.main.db_name },
+    { name = "BLAKSMITH_DB_OWNER_USER", value = aws_db_instance.main.username },
+    { name = "BLAKSMITH_DB_OWNER_SECRET_ARN", value = aws_db_instance.main.master_user_secret[0].secret_arn },
+    { name = "BLAKSMITH_DB_APP_USER", value = "blaksmith_app" },
+    { name = "DB_POOL_MAX", value = tostring(var.db_pool_max) },
+    { name = "BLAKSMITH_KEY_PROVIDER", value = "aws-kms" },
+    { name = "BLAKSMITH_KMS_ALIAS_PREFIX", value = "alias/${local.name}" },
+    { name = "BLAKSMITH_ESCROW", value = var.escrow_account_id == "" ? "off" : "aws-kms" },
+    { name = "BLAKSMITH_ESCROW_ACCOUNT_ID", value = var.escrow_account_id },
+    { name = "BLAKSMITH_ESCROW_REGION", value = var.region },
+    { name = "BLAKSMITH_STORAGE", value = "s3" },
+    { name = "BLAKSMITH_S3_BUCKET", value = aws_s3_bucket.documents.id },
+    { name = "BLAKSMITH_S3_KMS_KEY_ID", value = aws_kms_key.storage.arn },
+    { name = "BLAKSMITH_EVIDENCE_BUCKET", value = aws_s3_bucket.evidence.id },
+  ]
+
+  runtime_secrets = [
+    {
+      name      = "BLAKSMITH_DB_APP_PASSWORD"
+      valueFrom = "${aws_secretsmanager_secret.application.arn}:app_database_password::"
+    },
+    {
+      name      = "BETTER_AUTH_SECRET"
+      valueFrom = "${aws_secretsmanager_secret.application.arn}:better_auth_secret::"
+    },
+  ]
+}
+
+# One-shot migrate (+ optional first-owner bootstrap). Not an ECS service — operators
+# RunTask this family before updating the web service. Web no longer migrates on start.
+resource "aws_ecs_task_definition" "migrate" {
+  count                    = local.deploy_migrate ? 1 : 0
+  family                   = "${local.name}-migrate"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = 512
+  memory                   = 1024
+  execution_role_arn       = aws_iam_role.task_execution[0].arn
+  task_role_arn            = aws_iam_role.task[0].arn
+
+  runtime_platform {
+    cpu_architecture        = "ARM64"
+    operating_system_family = "LINUX"
+  }
+
+  volume {
+    name = "tmp"
+  }
+
+  container_definitions = jsonencode([{
+    name                   = "migrate"
+    image                  = var.migrate_image_uri
+    essential              = true
+    readonlyRootFilesystem = true
+
+    mountPoints = [{
+      sourceVolume  = "tmp"
+      containerPath = "/tmp"
+      readOnly      = false
+    }]
+
+    environment = [
+      { name = "NODE_ENV", value = "production" },
+      { name = "AWS_REGION", value = var.region },
+      { name = "HOME", value = "/tmp" },
+      { name = "TSX_DISABLE_CACHE", value = "1" },
+      { name = "BLAKSMITH_BOOTSTRAP_TENANT_SLUG", value = var.bootstrap_tenant_slug },
+      { name = "BLAKSMITH_BOOTSTRAP_TENANT_NAME", value = var.bootstrap_tenant_name },
+      { name = "BLAKSMITH_BOOTSTRAP_OWNER_EMAIL", value = var.bootstrap_owner_email },
+      { name = "BLAKSMITH_BOOTSTRAP_OWNER_NAME", value = var.bootstrap_owner_name },
+      { name = "BLAKSMITH_DB_HOST", value = aws_db_instance.main.address },
+      { name = "BLAKSMITH_DB_PORT", value = tostring(aws_db_instance.main.port) },
+      { name = "BLAKSMITH_DB_NAME", value = aws_db_instance.main.db_name },
+      { name = "BLAKSMITH_DB_APP_USER", value = "blaksmith_app" },
+    ]
+
+    secrets = [
+      {
+        name      = "BLAKSMITH_DB_OWNER_USER"
+        valueFrom = "${aws_db_instance.main.master_user_secret[0].secret_arn}:username::"
+      },
+      {
+        name      = "BLAKSMITH_DB_OWNER_PASSWORD"
+        valueFrom = "${aws_db_instance.main.master_user_secret[0].secret_arn}:password::"
+      },
+      {
+        name      = "BLAKSMITH_DB_APP_PASSWORD"
+        valueFrom = "${aws_secretsmanager_secret.application.arn}:app_database_password::"
+      },
+      {
+        name      = "BLAKSMITH_BOOTSTRAP_OWNER_PASSWORD"
+        valueFrom = "${aws_secretsmanager_secret.application.arn}:bootstrap_owner_password::"
+      },
+    ]
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.app[0].name
+        "awslogs-region"        = var.region
+        "awslogs-stream-prefix" = "migrate"
+      }
+    }
+  }])
+
+  depends_on = [aws_secretsmanager_secret_version.application]
 }
 
 resource "aws_ecs_task_definition" "app" {
@@ -209,6 +554,10 @@ resource "aws_ecs_task_definition" "app" {
     operating_system_family = "LINUX"
   }
 
+  volume {
+    name = "tmp"
+  }
+
   container_definitions = jsonencode([{
     name      = "web"
     image     = var.web_image_uri
@@ -218,52 +567,17 @@ resource "aws_ecs_task_definition" "app" {
     # persistence for an attacker who achieves code execution.
     readonlyRootFilesystem = true
 
+    mountPoints = [{
+      sourceVolume  = "tmp"
+      containerPath = "/tmp"
+      readOnly      = false
+    }]
+
     portMappings = [{ containerPort = 3000, protocol = "tcp" }]
 
-    environment = [
-      { name = "NODE_ENV", value = "production" },
-      { name = "AWS_REGION", value = var.region },
-      { name = "APP_URL", value = var.public_url },
-      { name = "BETTER_AUTH_URL", value = var.public_url },
-      { name = "BETTER_AUTH_TRUSTED_PROXIES", value = var.vpc_cidr },
-      { name = "BLAKSMITH_BOOTSTRAP_TENANT_SLUG", value = var.bootstrap_tenant_slug },
-      { name = "BLAKSMITH_BOOTSTRAP_TENANT_NAME", value = var.bootstrap_tenant_name },
-      { name = "BLAKSMITH_BOOTSTRAP_OWNER_EMAIL", value = var.bootstrap_owner_email },
-      { name = "BLAKSMITH_BOOTSTRAP_OWNER_NAME", value = var.bootstrap_owner_name },
-      { name = "BLAKSMITH_DB_HOST", value = aws_db_instance.main.address },
-      { name = "BLAKSMITH_DB_PORT", value = tostring(aws_db_instance.main.port) },
-      { name = "BLAKSMITH_DB_NAME", value = aws_db_instance.main.db_name },
-      { name = "BLAKSMITH_DB_APP_USER", value = "blaksmith_app" },
-      { name = "BLAKSMITH_KEY_PROVIDER", value = "aws-kms" },
-      { name = "BLAKSMITH_KMS_ALIAS_PREFIX", value = "alias/${local.name}" },
-      { name = "BLAKSMITH_STORAGE", value = "s3" },
-      { name = "BLAKSMITH_S3_BUCKET", value = aws_s3_bucket.documents.id },
-      { name = "BLAKSMITH_S3_KMS_KEY_ID", value = aws_kms_key.storage.arn },
-      { name = "BLAKSMITH_EVIDENCE_BUCKET", value = aws_s3_bucket.evidence.id },
-    ]
+    environment = local.runtime_environment
 
-    secrets = [
-      {
-        name      = "BLAKSMITH_DB_OWNER_USER"
-        valueFrom = "${aws_db_instance.main.master_user_secret[0].secret_arn}:username::"
-      },
-      {
-        name      = "BLAKSMITH_DB_OWNER_PASSWORD"
-        valueFrom = "${aws_db_instance.main.master_user_secret[0].secret_arn}:password::"
-      },
-      {
-        name      = "BLAKSMITH_DB_APP_PASSWORD"
-        valueFrom = "${aws_secretsmanager_secret.application.arn}:app_database_password::"
-      },
-      {
-        name      = "BETTER_AUTH_SECRET"
-        valueFrom = "${aws_secretsmanager_secret.application.arn}:better_auth_secret::"
-      },
-      {
-        name      = "BLAKSMITH_BOOTSTRAP_OWNER_PASSWORD"
-        valueFrom = "${aws_secretsmanager_secret.application.arn}:bootstrap_owner_password::"
-      },
-    ]
+    secrets = local.runtime_secrets
 
     logConfiguration = {
       logDriver = "awslogs"
@@ -274,12 +588,61 @@ resource "aws_ecs_task_definition" "app" {
       }
     }
 
-    healthCheck = {
-      command     = ["CMD-SHELL", "node -e \"fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
-      interval    = 30
-      timeout     = 5
-      retries     = 3
-      startPeriod = 60
+    # ALB already probes /api/health. A second in-container `node -e` probe
+    # fails on the read-only rootfs and ECS replaces otherwise-healthy tasks.
+  }])
+
+  depends_on = [aws_secretsmanager_secret_version.application]
+}
+
+# REST API. Same task role, subnets, and security group as web. Not an ALB target:
+# the web UI and this API both serve /nodes.
+resource "aws_ecs_task_definition" "api" {
+  count                    = local.deploy_api ? 1 : 0
+  family                   = "${local.name}-api"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = 1024
+  memory                   = 2048
+  execution_role_arn       = aws_iam_role.task_execution[0].arn
+  task_role_arn            = aws_iam_role.task[0].arn
+
+  runtime_platform {
+    cpu_architecture        = "ARM64"
+    operating_system_family = "LINUX"
+  }
+
+  volume {
+    name = "tmp"
+  }
+
+  container_definitions = jsonencode([{
+    name                   = "api"
+    image                  = var.api_image_uri
+    essential              = true
+    readonlyRootFilesystem = true
+
+    mountPoints = [{
+      sourceVolume  = "tmp"
+      containerPath = "/tmp"
+      readOnly      = false
+    }]
+
+    portMappings = [{ containerPort = 8080, protocol = "tcp" }]
+
+    environment = concat(local.runtime_environment, [
+      { name = "API_PORT", value = "8080" },
+    ])
+
+    secrets = local.runtime_secrets
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.app[0].name
+        "awslogs-region"        = var.region
+        "awslogs-stream-prefix" = "api"
+      }
     }
   }])
 
@@ -301,43 +664,27 @@ resource "aws_ecs_task_definition" "worker" {
     operating_system_family = "LINUX"
   }
 
+  volume {
+    name = "tmp"
+  }
+
   container_definitions = jsonencode([{
     name                   = "worker"
     image                  = var.worker_image_uri
     essential              = true
     readonlyRootFilesystem = true
 
-    environment = [
-      { name = "NODE_ENV", value = "production" },
-      { name = "AWS_REGION", value = var.region },
-      { name = "HOME", value = "/tmp" },
-      { name = "AUTOINGEST_JOBS", value = "[]" },
-      { name = "BLAKSMITH_DB_HOST", value = aws_db_instance.main.address },
-      { name = "BLAKSMITH_DB_PORT", value = tostring(aws_db_instance.main.port) },
-      { name = "BLAKSMITH_DB_NAME", value = aws_db_instance.main.db_name },
-      { name = "BLAKSMITH_DB_APP_USER", value = "blaksmith_app" },
-      { name = "BLAKSMITH_KEY_PROVIDER", value = "aws-kms" },
-      { name = "BLAKSMITH_KMS_ALIAS_PREFIX", value = "alias/${local.name}" },
-      { name = "BLAKSMITH_STORAGE", value = "s3" },
-      { name = "BLAKSMITH_S3_BUCKET", value = aws_s3_bucket.documents.id },
-      { name = "BLAKSMITH_S3_KMS_KEY_ID", value = aws_kms_key.storage.arn },
-      { name = "BLAKSMITH_EVIDENCE_BUCKET", value = aws_s3_bucket.evidence.id },
-    ]
+    mountPoints = [{
+      sourceVolume  = "tmp"
+      containerPath = "/tmp"
+      readOnly      = false
+    }]
 
-    secrets = [
-      {
-        name      = "BLAKSMITH_DB_OWNER_USER"
-        valueFrom = "${aws_db_instance.main.master_user_secret[0].secret_arn}:username::"
-      },
-      {
-        name      = "BLAKSMITH_DB_OWNER_PASSWORD"
-        valueFrom = "${aws_db_instance.main.master_user_secret[0].secret_arn}:password::"
-      },
-      {
-        name      = "BLAKSMITH_DB_APP_PASSWORD"
-        valueFrom = "${aws_secretsmanager_secret.application.arn}:app_database_password::"
-      },
-    ]
+    environment = concat(local.runtime_environment, [
+      { name = "TSX_DISABLE_CACHE", value = "1" },
+    ])
+
+    secrets = local.runtime_secrets
 
     logConfiguration = {
       logDriver = "awslogs"
@@ -364,6 +711,7 @@ resource "aws_ecs_service" "app" {
   # for an API fronting land registry queries is a self-inflicted outage.
   deployment_minimum_healthy_percent = 100
   deployment_maximum_percent         = 200
+  health_check_grace_period_seconds  = 180
 
   network_configuration {
     subnets = aws_subnet.application[*].id
@@ -389,6 +737,31 @@ resource "aws_ecs_service" "app" {
   depends_on = [aws_lb_listener.https]
 }
 
+resource "aws_ecs_service" "api" {
+  count           = local.deploy_api ? 1 : 0
+  name            = "${local.name}-api"
+  cluster         = aws_ecs_cluster.main[0].id
+  task_definition = aws_ecs_task_definition.api[0].arn
+  desired_count   = var.desired_count
+  launch_type     = "FARGATE"
+
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+
+  network_configuration {
+    subnets          = aws_subnet.application[*].id
+    assign_public_ip = false
+    security_groups  = [aws_security_group.service[0].id]
+  }
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
+  enable_execute_command = false
+}
+
 resource "aws_ecs_service" "worker" {
   count           = local.deploy_worker ? 1 : 0
   name            = "${local.name}-worker"
@@ -408,7 +781,7 @@ resource "aws_ecs_service" "worker" {
 
   deployment_circuit_breaker {
     enable   = true
-    rollback = false
+    rollback = true
   }
 
   enable_execute_command = false
@@ -441,9 +814,9 @@ resource "aws_security_group" "alb" {
 
   egress {
     description = "To the application tier"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
     cidr_blocks = [var.vpc_cidr]
   }
 
@@ -467,6 +840,8 @@ resource "aws_lb" "main" {
     prefix  = "alb"
     enabled = true
   }
+
+  depends_on = [aws_s3_bucket_policy.access_logs]
 }
 
 resource "aws_lb_target_group" "app" {

@@ -61,6 +61,16 @@ output "web_service_name" {
   value       = local.deploy_app ? aws_ecs_service.app[0].name : null
 }
 
+output "api_service_name" {
+  description = "ECS API service name. Private to the application security group on 8080; not an ALB target."
+  value       = local.deploy_api ? aws_ecs_service.api[0].name : null
+}
+
+output "migrate_task_definition_arn" {
+  description = "One-shot migrate task definition. RunTask this before rolling the web service; web no longer migrates on start."
+  value       = local.deploy_migrate ? aws_ecs_task_definition.migrate[0].arn : null
+}
+
 output "worker_service_name" {
   description = "ECS worker service name, when configured."
   value       = local.deploy_worker ? aws_ecs_service.worker[0].name : null

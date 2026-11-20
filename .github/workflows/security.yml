@@ -24,6 +24,7 @@ jobs:
         run: |
           terraform init -backend=false
           terraform validate
+          terraform test
 
   checkov:
     name: Checkov

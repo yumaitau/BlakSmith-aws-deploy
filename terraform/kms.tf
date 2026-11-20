@@ -96,10 +96,10 @@ data "aws_iam_policy_document" "logs_key" {
     }
   }
 
-  # CloudTrail, Config and CloudWatch Logs write with a service principal, not a role, so the
-  # key policy must allow them explicitly.
+  # CloudTrail, Config and SNS write with a service principal, not a role, so the key policy
+  # must allow them explicitly.
   statement {
-    sid       = "AllowLogServiceEncryption"
+    sid       = "AllowAuditServiceEncryption"
     actions   = ["kms:GenerateDataKey*", "kms:Decrypt", "kms:DescribeKey"]
     resources = ["*"]
 
@@ -108,7 +108,6 @@ data "aws_iam_policy_document" "logs_key" {
       identifiers = [
         "cloudtrail.amazonaws.com",
         "config.amazonaws.com",
-        "logs.${var.region}.amazonaws.com",
         "sns.amazonaws.com",
       ]
     }
@@ -119,6 +118,32 @@ data "aws_iam_policy_document" "logs_key" {
       test     = "StringEquals"
       variable = "aws:SourceAccount"
       values   = [local.account_id]
+    }
+  }
+
+  # CloudWatch Logs validates this permission while associating the key with a log group and
+  # supplies the log-group ARN as KMS encryption context. Scope the service to this account's
+  # log groups instead of granting a region-wide logs principal unrestricted key use.
+  statement {
+    sid = "AllowCloudWatchLogsEncryption"
+    actions = [
+      "kms:Decrypt",
+      "kms:DescribeKey",
+      "kms:Encrypt",
+      "kms:GenerateDataKey*",
+      "kms:ReEncrypt*",
+    ]
+    resources = ["*"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["logs.${var.region}.amazonaws.com"]
+    }
+
+    condition {
+      test     = "ArnLike"
+      variable = "kms:EncryptionContext:aws:logs:arn"
+      values   = ["arn:aws:logs:${var.region}:${local.account_id}:log-group:*"]
     }
   }
 }

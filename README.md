@@ -17,8 +17,9 @@ The product images live in AWS Marketplace ECR:
 ```
 
 Use only the immutable `sha-<commit>` tag or digest shown in the Marketplace delivery
-instructions. Never use `latest`. The Terraform stack deploys the web app and can enable the
-worker after the web service has completed database bootstrap.
+instructions. Never use `latest`. The Terraform stack deploys the web and private API
+services, registers a one-shot migrate task definition, and can enable the worker after
+migrations and web health checks complete.
 
 ## What Terraform creates
 
@@ -47,7 +48,8 @@ cp terraform.tfvars.example terraform.tfvars
 
 Edit `terraform.tfvars`:
 
-1. Set `web_image_uri` and `worker_image_uri` to existing Marketplace ECR SHA tags.
+1. Set `web_image_uri`, `api_image_uri`, `migrate_image_uri`, and (optionally) `worker_image_uri`
+   to existing Marketplace ECR SHA tags.
 2. Set `public_url` to the HTTPS origin covered by `certificate_arn`.
 3. Choose `environment = "buyer"` for a limited-offer test or `"prod"` for retained,
    deletion-protected production resources.
@@ -67,11 +69,16 @@ terraform apply tfplan
 terraform output load_balancer_dns
 ```
 
-Point the `public_url` hostname at `load_balancer_dns`. After the web service is healthy and
-`GET /api/health` succeeds, set `worker_desired_count = 1` and apply again.
+Run the one-shot `migrate` task definition (`terraform output -raw migrate_task_definition_arn`)
+via `aws ecs run-task` in the application subnets to install extensions, apply migrations, and
+idempotently provision the initial owner. Point the `public_url` hostname at `load_balancer_dns`.
+After the web service is healthy and `GET /api/health` succeeds, set `worker_desired_count = 1`
+and apply again.
 
-The licensed web startup provisions the specified owner idempotently. Retrieve the generated
-one-time password without printing any other secret fields, sign in, and rotate it immediately:
+The one-shot migrate task provisions the specified owner idempotently; long-running web, API,
+and worker tasks never receive the bootstrap password or static DB owner password. Retrieve the
+generated one-time password without printing any other secret fields, sign in, and rotate it
+immediately:
 
 ```sh
 secret_arn="$(terraform output -raw application_secret_arn)"

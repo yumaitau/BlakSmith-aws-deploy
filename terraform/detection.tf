@@ -60,6 +60,8 @@ resource "aws_s3_bucket_object_lock_configuration" "trail" {
       days = var.trail_retention_days
     }
   }
+
+  depends_on = [aws_s3_bucket_versioning.trail]
 }
 
 data "aws_iam_policy_document" "trail_bucket" {
@@ -88,17 +90,6 @@ data "aws_iam_policy_document" "trail_bucket" {
       test     = "StringEquals"
       variable = "s3:x-amz-acl"
       values   = ["bucket-owner-full-control"]
-    }
-  }
-
-  statement {
-    sid       = "AWSConfigWrite"
-    actions   = ["s3:PutObject", "s3:GetBucketAcl"]
-    resources = [aws_s3_bucket.trail.arn, "${aws_s3_bucket.trail.arn}/config/*"]
-
-    principals {
-      type        = "Service"
-      identifiers = ["config.amazonaws.com"]
     }
   }
 
@@ -141,6 +132,129 @@ resource "aws_s3_bucket_logging" "trail" {
 resource "aws_s3_bucket_policy" "trail" {
   bucket = aws_s3_bucket.trail.id
   policy = data.aws_iam_policy_document.trail_bucket.json
+}
+
+# AWS Config validates its delivery bucket by writing a test object before the delivery
+# channel is created. Keep that path separate from the Object Lock and customer-managed KMS
+# controls on the CloudTrail archive; those controls are intentionally stricter than Config's
+# delivery-channel validation supports.
+resource "aws_s3_bucket" "config" {
+  #checkov:skip=CKV_AWS_145:AWS Config delivery-channel validation requires SSE-S3 on the delivery bucket
+  bucket        = "${local.name}-config-${local.bucket_suffix}"
+  force_destroy = !local.is_prod
+}
+
+resource "aws_s3_bucket_public_access_block" "config" {
+  bucket                  = aws_s3_bucket.config.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# trivy:ignore:AWS-0132 AWS Config delivery-channel validation requires SSE-S3 on the delivery bucket
+resource "aws_s3_bucket_server_side_encryption_configuration" "config" {
+  bucket = aws_s3_bucket.config.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_versioning" "config" {
+  bucket = aws_s3_bucket.config.id
+  versioning_configuration { status = "Enabled" }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "config" {
+  bucket = aws_s3_bucket.config.id
+
+  rule {
+    id     = "expire"
+    status = "Enabled"
+    filter {}
+    expiration { days = 400 }
+    abort_incomplete_multipart_upload { days_after_initiation = 7 }
+  }
+}
+
+resource "aws_s3_bucket_logging" "config" {
+  bucket        = aws_s3_bucket.config.id
+  target_bucket = aws_s3_bucket.access_logs.id
+  target_prefix = "config/"
+}
+
+data "aws_iam_policy_document" "config_bucket" {
+  statement {
+    sid       = "AWSConfigBucketPermissionsCheck"
+    actions   = ["s3:GetBucketAcl", "s3:ListBucket"]
+    resources = [aws_s3_bucket.config.arn]
+
+    principals {
+      type        = "Service"
+      identifiers = ["config.amazonaws.com"]
+    }
+  }
+
+  statement {
+    sid       = "AWSConfigBucketDelivery"
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.config.arn}/config/AWSLogs/${local.account_id}/Config/*"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["config.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "s3:x-amz-acl"
+      values   = ["bucket-owner-full-control"]
+    }
+  }
+
+  statement {
+    sid       = "DenyInsecureTransport"
+    effect    = "Deny"
+    actions   = ["s3:*"]
+    resources = [aws_s3_bucket.config.arn, "${aws_s3_bucket.config.arn}/*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["false"]
+    }
+  }
+
+  statement {
+    sid       = "DenyOutdatedTls"
+    effect    = "Deny"
+    actions   = ["s3:*"]
+    resources = [aws_s3_bucket.config.arn, "${aws_s3_bucket.config.arn}/*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "NumericLessThan"
+      variable = "s3:TlsVersion"
+      values   = ["1.2"]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "config" {
+  bucket = aws_s3_bucket.config.id
+  policy = data.aws_iam_policy_document.config_bucket.json
 }
 
 # A CloudWatch copy of the trail makes it searchable and alertable in near real time. The S3
@@ -203,8 +317,9 @@ resource "aws_cloudtrail" "main" {
 
   # Management events alone record that a bucket exists, not that someone read every object
   # in it — which is the event that matters when the objects are land title documents.
+  # Exclude the trail, config, and access-logs buckets to avoid a recursive log-of-logs loop.
   advanced_event_selector {
-    name = "S3 and KMS data events"
+    name = "S3 object data events"
 
     field_selector {
       field  = "eventCategory"
@@ -214,6 +329,15 @@ resource "aws_cloudtrail" "main" {
     field_selector {
       field  = "resources.type"
       equals = ["AWS::S3::Object"]
+    }
+
+    field_selector {
+      field = "resources.ARN"
+      not_starts_with = [
+        "${aws_s3_bucket.trail.arn}/",
+        "${aws_s3_bucket.config.arn}/",
+        "${aws_s3_bucket.access_logs.arn}/",
+      ]
     }
   }
 
@@ -296,9 +420,9 @@ resource "aws_config_configuration_recorder" "main" {
 
 resource "aws_config_delivery_channel" "main" {
   name           = "${local.name}-delivery"
-  s3_bucket_name = aws_s3_bucket.trail.id
+  s3_bucket_name = aws_s3_bucket.config.id
   s3_key_prefix  = "config"
-  depends_on     = [aws_config_configuration_recorder.main, aws_s3_bucket_policy.trail]
+  depends_on     = [aws_config_configuration_recorder.main, aws_s3_bucket_policy.config]
 }
 
 resource "aws_config_configuration_recorder_status" "main" {
@@ -310,24 +434,28 @@ resource "aws_config_configuration_recorder_status" "main" {
 # A focused set of managed rules: the ones whose failure would directly break a promise made
 # in docs/security-architecture.md. Security Hub's standards cover far more.
 locals {
-  config_rules = {
-    s3-public-read-prohibited  = "S3_BUCKET_PUBLIC_READ_PROHIBITED"
-    s3-public-write-prohibited = "S3_BUCKET_PUBLIC_WRITE_PROHIBITED"
-    s3-ssl-requests-only       = "S3_BUCKET_SSL_REQUESTS_ONLY"
-    s3-sse-enabled             = "S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED"
-    rds-storage-encrypted      = "RDS_STORAGE_ENCRYPTED"
-    rds-not-public             = "RDS_INSTANCE_PUBLIC_ACCESS_CHECK"
-    rds-multi-az               = "RDS_MULTI_AZ_SUPPORT"
-    rds-deletion-protection    = "RDS_INSTANCE_DELETION_PROTECTION_ENABLED"
-    cloudtrail-enabled         = "CLOUD_TRAIL_ENABLED"
-    cloudtrail-encrypted       = "CLOUD_TRAIL_ENCRYPTION_ENABLED"
-    cloudtrail-validation      = "CLOUD_TRAIL_LOG_FILE_VALIDATION_ENABLED"
-    kms-rotation-enabled       = "CMK_BACKING_KEY_ROTATION_ENABLED"
-    vpc-flow-logs-enabled      = "VPC_FLOW_LOGS_ENABLED"
-    iam-root-access-key        = "IAM_ROOT_ACCESS_KEY_CHECK"
-    iam-console-mfa            = "MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS"
-    ebs-encryption-by-default  = "EC2_EBS_ENCRYPTION_BY_DEFAULT"
-  }
+  config_rules = merge(
+    {
+      s3-public-read-prohibited  = "S3_BUCKET_PUBLIC_READ_PROHIBITED"
+      s3-public-write-prohibited = "S3_BUCKET_PUBLIC_WRITE_PROHIBITED"
+      s3-ssl-requests-only       = "S3_BUCKET_SSL_REQUESTS_ONLY"
+      s3-sse-enabled             = "S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED"
+      rds-storage-encrypted      = "RDS_STORAGE_ENCRYPTED"
+      rds-not-public             = "RDS_INSTANCE_PUBLIC_ACCESS_CHECK"
+      cloudtrail-enabled         = "CLOUD_TRAIL_ENABLED"
+      cloudtrail-encrypted       = "CLOUD_TRAIL_ENCRYPTION_ENABLED"
+      cloudtrail-validation      = "CLOUD_TRAIL_LOG_FILE_VALIDATION_ENABLED"
+      kms-rotation-enabled       = "CMK_BACKING_KEY_ROTATION_ENABLED"
+      vpc-flow-logs-enabled      = "VPC_FLOW_LOGS_ENABLED"
+      iam-root-access-key        = "IAM_ROOT_ACCESS_KEY_CHECK"
+      iam-console-mfa            = "MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS"
+      ebs-encryption-by-default  = "EC2_EBS_ENCRYPTION_BY_DEFAULT"
+    },
+    local.is_prod ? {
+      rds-multi-az            = "RDS_MULTI_AZ_SUPPORT"
+      rds-deletion-protection = "RDS_INSTANCE_DELETION_PROTECTION_ENABLED"
+    } : {},
+  )
 }
 
 resource "aws_config_config_rule" "managed" {
@@ -414,6 +542,12 @@ data "aws_iam_policy_document" "sns_events" {
     principals {
       type        = "Service"
       identifiers = ["events.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [local.account_id]
     }
   }
 }

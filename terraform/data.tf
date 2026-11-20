@@ -95,6 +95,17 @@ resource "aws_s3_bucket_logging" "documents" {
   target_prefix = "documents/"
 }
 
+resource "aws_s3_bucket_lifecycle_configuration" "documents" {
+  bucket = aws_s3_bucket.documents.id
+
+  rule {
+    id     = "abort-incomplete-multipart"
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload { days_after_initiation = 7 }
+  }
+}
+
 # Evidence. Object Lock CANNOT be enabled after creation, so it is on unconditionally: if
 # immutability might ever be required, the decision has to be made now.
 resource "aws_s3_bucket" "evidence" {
@@ -144,19 +155,14 @@ resource "aws_s3_bucket_object_lock_configuration" "evidence" {
       days = var.evidence_retention_days
     }
   }
+
+  depends_on = [aws_s3_bucket_versioning.evidence]
 }
 
-# Lifecycle rules here only clean up abandoned multipart uploads. Records are never expired by
-# lifecycle: retention is governed by versioning and, for evidence, Object Lock.
-resource "aws_s3_bucket_lifecycle_configuration" "documents" {
-  bucket = aws_s3_bucket.documents.id
-
-  rule {
-    id     = "abort-incomplete-uploads"
-    status = "Enabled"
-    filter {}
-    abort_incomplete_multipart_upload { days_after_initiation = 7 }
-  }
+resource "aws_s3_bucket_logging" "evidence" {
+  bucket        = aws_s3_bucket.evidence.id
+  target_bucket = aws_s3_bucket.access_logs.id
+  target_prefix = "evidence/"
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "evidence" {
@@ -168,12 +174,6 @@ resource "aws_s3_bucket_lifecycle_configuration" "evidence" {
     filter {}
     abort_incomplete_multipart_upload { days_after_initiation = 7 }
   }
-}
-
-resource "aws_s3_bucket_logging" "evidence" {
-  bucket        = aws_s3_bucket.evidence.id
-  target_bucket = aws_s3_bucket.access_logs.id
-  target_prefix = "evidence/"
 }
 
 # TLS floor on every bucket. aws:SecureTransport alone permits TLS 1.0/1.1; s3:TlsVersion is
@@ -222,6 +222,47 @@ data "aws_iam_policy_document" "bucket_tls" {
   }
 }
 
+data "aws_elb_service_account" "main" {}
+
+data "aws_iam_policy_document" "access_logs" {
+  source_policy_documents = [data.aws_iam_policy_document.bucket_tls["access_logs"].json]
+
+  # Regional ELB service account for ALB access log delivery.
+  statement {
+    sid       = "AllowAlbLogDelivery"
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.access_logs.arn}/alb/AWSLogs/${local.account_id}/*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = [data.aws_elb_service_account.main.arn]
+    }
+  }
+
+  # Service principal for regions/features that deliver via logdelivery.elasticloadbalancing.
+  statement {
+    sid       = "AllowAlbServiceLogDelivery"
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.access_logs.arn}/alb/AWSLogs/${local.account_id}/*"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["logdelivery.elasticloadbalancing.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [local.account_id]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "access_logs" {
+  bucket = aws_s3_bucket.access_logs.id
+  policy = data.aws_iam_policy_document.access_logs.json
+}
+
 resource "aws_s3_bucket_policy" "documents" {
   bucket = aws_s3_bucket.documents.id
   policy = data.aws_iam_policy_document.bucket_tls["documents"].json
@@ -268,7 +309,7 @@ resource "aws_db_parameter_group" "main" {
 
   parameter {
     name  = "log_connections"
-    value = "1"
+    value = "all"
   }
 
   parameter {

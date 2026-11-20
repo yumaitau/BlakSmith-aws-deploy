@@ -39,13 +39,13 @@ variable "vpc_cidr" {
 }
 
 variable "az_count" {
-  description = "Availability zones to span. Two is the minimum for RDS Multi-AZ."
+  description = "Availability zones to span. Two is the minimum for RDS Multi-AZ; four is the maximum before application /22 subnets overlap data subnets."
   type        = number
   default     = 3
 
   validation {
-    condition     = var.az_count >= 2
-    error_message = "az_count must be at least 2 so the database can run Multi-AZ."
+    condition     = var.az_count >= 2 && var.az_count <= 4
+    error_message = "az_count must be between 2 and 4 so RDS can run Multi-AZ without subnet CIDR overlap."
   }
 }
 
@@ -97,8 +97,20 @@ variable "web_image_uri" {
   default     = ""
 }
 
+variable "api_image_uri" {
+  description = "BlakSmith API image. Required when web_image_uri is set."
+  type        = string
+  default     = ""
+}
+
 variable "worker_image_uri" {
-  description = "Optional BlakSmith worker image from AWS Marketplace ECR."
+  description = "Optional BlakSmith worker image from AWS Marketplace ECR. Omit AUTOINGEST_JOBS; an empty array is rejected by the worker."
+  type        = string
+  default     = ""
+}
+
+variable "migrate_image_uri" {
+  description = "BlakSmith migrate one-shot image. Required when web_image_uri is set; run via ECS RunTask before rolling the web service."
   type        = string
   default     = ""
 }
@@ -145,9 +157,25 @@ variable "certificate_arn" {
 }
 
 variable "desired_count" {
-  description = "Number of web application tasks."
+  description = "Number of web tasks and of API tasks."
   type        = number
   default     = 2
+}
+
+variable "db_pool_max" {
+  description = <<-EOT
+    postgres.js pool size per pool (DB_POOL_MAX). Each web, API and worker task opens one owner
+    pool and one app-role pool, so the worst-case backend count is
+    (2 x desired_count + worker_desired_count) x 2 x db_pool_max. Keep it under the instance's
+    max_connections with room for migrate and admin sessions.
+  EOT
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.db_pool_max >= 1 && var.db_pool_max <= 50
+    error_message = "db_pool_max must be between 1 and 50."
+  }
 }
 
 variable "worker_desired_count" {
@@ -157,12 +185,14 @@ variable "worker_desired_count" {
 }
 
 locals {
-  is_prod       = var.environment == "prod"
-  name          = "${var.name_prefix}-${var.environment}"
-  account_id    = data.aws_caller_identity.current.account_id
-  deploy_app    = var.web_image_uri != ""
-  deploy_worker = local.deploy_app && var.worker_image_uri != ""
-  azs           = slice(data.aws_availability_zones.available.names, 0, var.az_count)
+  is_prod        = var.environment == "prod"
+  name           = "${var.name_prefix}-${var.environment}"
+  account_id     = data.aws_caller_identity.current.account_id
+  deploy_app     = var.web_image_uri != ""
+  deploy_api     = local.deploy_app && var.api_image_uri != ""
+  deploy_worker  = local.deploy_app && var.worker_image_uri != ""
+  deploy_migrate = local.deploy_app && var.migrate_image_uri != ""
+  azs            = slice(data.aws_availability_zones.available.names, 0, var.az_count)
 }
 
 data "aws_availability_zones" "available" {
@@ -193,10 +223,50 @@ resource "terraform_data" "require_tls" {
       error_message = "worker_image_uri is required when worker_desired_count is greater than zero."
     }
 
+    precondition {
+      condition     = var.api_image_uri != ""
+      error_message = "api_image_uri is required when web_image_uri is set."
+    }
+
+    precondition {
+      condition     = var.migrate_image_uri != ""
+      error_message = "migrate_image_uri is required when web_image_uri is set; run the migrate task before rolling web and API."
+    }
 
     precondition {
       condition     = can(regex("^[^@[:space:]]+@[^@[:space:]]+\\.[^@[:space:]]+$", var.bootstrap_owner_email))
       error_message = "bootstrap_owner_email must be a valid email address when web_image_uri is set."
     }
+  }
+}
+
+variable "customer_key_tenants" {
+  description = "Customer-keyed tenants: map of tenant id to the client's CMK ARN. Creates role <name>-tenant-<id> for the client's key policy to grant (#140)."
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition = alltrue([
+      for id, arn in var.customer_key_tenants :
+      can(regex("^[A-Za-z0-9._:-]+$", id)) && can(regex("^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/.+$", arn))
+    ])
+    error_message = "Keys must be tenant ids without path characters; values must be full KMS key ARNs (aliases do not work cross-account)."
+  }
+}
+
+variable "tenant_key_self_provisioning" {
+  description = "Let the application create a vendor tenant CMK + alias when a tenant is created (#139). It still cannot delete, disable or re-policy keys."
+  type        = bool
+  default     = true
+}
+
+variable "escrow_account_id" {
+  description = "BlakSmith escrow AWS account (#141). Empty disables escrow deposits. The task role gets Encrypt only, with an explicit Deny on Decrypt/ReEncrypt."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.escrow_account_id == "" || can(regex("^[0-9]{12}$", var.escrow_account_id))
+    error_message = "escrow_account_id must be empty or a 12-digit account id."
   }
 }

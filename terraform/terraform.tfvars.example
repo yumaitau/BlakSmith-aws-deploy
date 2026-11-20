@@ -22,8 +22,11 @@ db_max_allocated_storage = 1000
 alert_email = "security@example.gov.au"
 
 # Leave web_image_uri empty on the first apply to provision infrastructure only. When set,
-# public_url and certificate_arn become required — there is no HTTP fallback.
+# public_url, certificate_arn, api_image_uri, and migrate_image_uri become required — there
+# is no HTTP fallback, and web no longer migrates on start (RunTask the migrate family first).
 web_image_uri        = ""
+api_image_uri        = ""
+migrate_image_uri    = ""
 worker_image_uri     = ""
 public_url           = "https://blaksmith.example.gov.au"
 certificate_arn      = ""

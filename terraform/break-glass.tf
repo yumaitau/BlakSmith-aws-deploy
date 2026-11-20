@@ -36,10 +36,11 @@ data "aws_iam_policy_document" "break_glass_assume" {
       values   = ["true"]
     }
 
-    # Belt and braces: even if a caller requests a longer session, cap it.
+    # Belt and braces: max_session_duration caps the role session to 1 hour, and requiring
+    # recent MFA authentication ensures a stale long-lived session cannot assume break-glass.
     condition {
       test     = "NumericLessThanEquals"
-      variable = "aws:TokenIssueTime"
+      variable = "aws:MultiFactorAuthAge"
       values   = ["3600"]
     }
   }
